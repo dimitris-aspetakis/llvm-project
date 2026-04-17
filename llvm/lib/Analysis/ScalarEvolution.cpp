@@ -316,6 +316,12 @@ void SCEV::computeAndSetCanonical(ScalarEvolution &SE) {
     CanonicalSCEV = SE.getAddRecExpr(
         CanonOps, cast<SCEVAddRecExpr>(this)->getLoop(), Flags);
     return;
+  case scConditionalAddRec: {
+    auto *CAR = cast<SCEVConditionalAddRecExpr>(this);
+    CanonicalSCEV = SE.getConditionalAddRecExpr(CanonOps[0], CanonOps[1],
+                                                CanonOps[2], CAR->getLoop());
+    return;
+  }
   case scSMaxExpr:
     CanonicalSCEV = SE.getSMaxExpr(CanonOps);
     return;
@@ -402,6 +408,15 @@ void SCEV::print(raw_ostream &OS) const {
     OS << ">";
     return;
   }
+  case scConditionalAddRec: {
+    const SCEVConditionalAddRecExpr *CAR =
+        cast<SCEVConditionalAddRecExpr>(this);
+    OS << "{" << *CAR->getStart() << ",+[" << *CAR->getCond() << "],"
+       << *CAR->getStep() << "}<";
+    CAR->getLoop()->getHeader()->printAsOperand(OS, /*PrintType=*/false);
+    OS << ">";
+    return;
+  }
   case scAddExpr:
   case scMulExpr:
   case scUMaxExpr:
@@ -474,6 +489,8 @@ Type *SCEV::getType() const {
     return cast<SCEVCastExpr>(this)->getType();
   case scAddRecExpr:
     return cast<SCEVAddRecExpr>(this)->getType();
+  case scConditionalAddRec:
+    return cast<SCEVConditionalAddRecExpr>(this)->getType();
   case scMulExpr:
     return cast<SCEVMulExpr>(this)->getType();
   case scUMaxExpr:
@@ -518,6 +535,8 @@ ArrayRef<SCEVUse> SCEV::operands() const {
     return cast<SCEVNAryExpr>(this)->operands();
   case scUDivExpr:
     return cast<SCEVUDivExpr>(this)->operands();
+  case scConditionalAddRec:
+    return cast<SCEVConditionalAddRecExpr>(this)->operands();
   case scCouldNotCompute:
     llvm_unreachable("Attempt to use a SCEVCouldNotCompute object!");
   }
@@ -815,6 +834,7 @@ CompareSCEVComplexity(const LoopInfo *const LI, const SCEV *LHS,
     [[fallthrough]];
   }
 
+  case scConditionalAddRec:
   case scTruncate:
   case scZeroExtend:
   case scSignExtend:
@@ -3134,6 +3154,46 @@ const SCEV *ScalarEvolution::getOrCreateAddRecExpr(ArrayRef<SCEVUse> Ops,
   return S;
 }
 
+const SCEV *ScalarEvolution::getConditionalAddRecExpr(const SCEV *Start,
+                                                       const SCEV *Cond,
+                                                       const SCEV *Step,
+                                                       const Loop *L) {
+  assert(Cond->getType()->isIntegerTy(1) &&
+         "SCEVConditionalAddRecExpr condition must be i1");
+  assert(isAvailableAtLoopEntry(Start, L) &&
+         "SCEVConditionalAddRecExpr start must be loop-invariant");
+  assert(isAvailableAtLoopEntry(Step, L) &&
+         "SCEVConditionalAddRecExpr step must be loop-invariant");
+
+  // Constant-fold: if Cond is always true, degenerate to a plain AddRec.
+  if (auto *ConstCond = dyn_cast<SCEVConstant>(Cond)) {
+    if (ConstCond->getValue()->isOne())
+      return getAddRecExpr(Start, Step, L, SCEV::FlagAnyWrap);
+    // Cond is always false: value never advances.
+    assert(ConstCond->getValue()->isZero());
+    return Start;
+  }
+
+  FoldingSetNodeID ID;
+  ID.AddInteger(scConditionalAddRec);
+  ID.AddPointer(Start);
+  ID.AddPointer(Cond);
+  ID.AddPointer(Step);
+  ID.AddPointer(L);
+  void *IP = nullptr;
+  if (const SCEV *S = UniqueSCEVs.FindNodeOrInsertPos(ID, IP))
+    return S;
+
+  SCEVConditionalAddRecExpr *S =
+      new (SCEVAllocator) SCEVConditionalAddRecExpr(
+          ID.Intern(SCEVAllocator), Start, Cond, Step, L);
+  UniqueSCEVs.InsertNode(S, IP);
+  S->computeAndSetCanonical(*this);
+  LoopUsers[L].push_back(S);
+  registerUser(S, ArrayRef<SCEVUse>({Start, Cond, Step}));
+  return S;
+}
+
 const SCEV *ScalarEvolution::getOrCreateMulExpr(ArrayRef<SCEVUse> Ops,
                                                 SCEV::NoWrapFlags Flags) {
   FoldingSetNodeID ID;
@@ -4220,6 +4280,10 @@ public:
 
   RetVal visitAddRecExpr(const SCEVAddRecExpr *Expr) { return Expr; }
 
+  RetVal visitConditionalAddRecExpr(const SCEVConditionalAddRecExpr *Expr) {
+    return Expr;
+  }
+
   RetVal visitSMaxExpr(const SCEVSMaxExpr *Expr) {
     return visitAnyMinMaxExpr(Expr);
   }
@@ -4260,6 +4324,7 @@ static bool scevUnconditionallyPropagatesPoisonFromOperands(SCEVTypes Kind) {
   case scMulExpr:
   case scUDivExpr:
   case scAddRecExpr:
+  case scConditionalAddRec:
   case scUMaxExpr:
   case scSMaxExpr:
   case scUMinExpr:
@@ -5974,6 +6039,46 @@ const SCEV *ScalarEvolution::createAddRecFromPHI(PHINode *PN) {
   if (auto *S = createSimpleAffineAddRec(PN, BEValueV, StartValueV))
     return S;
 
+  // Try to recognize: PN = select(Cond, PN+Step, PN) — a conditional IV
+  // where the recurrence advances by Step only when Cond is true.
+  if (auto *SI = dyn_cast<SelectInst>(BEValueV)) {
+    Value *SelCond = SI->getCondition();
+    Value *TV = SI->getTrueValue();
+    Value *FV = SI->getFalseValue();
+
+    // Normalize so that FV == PN (the unchanged case) and TV == PN+Step.
+    // If it's the other way (TV == PN, FV == PN+Step), negate the condition.
+    bool NegCond = false;
+    if (TV == PN && FV != PN) {
+      std::swap(TV, FV);
+      NegCond = true;
+    }
+
+    if (FV == PN) {
+      // TV must be PN + loop-invariant step.
+      const SCEV *Step = nullptr;
+      if (auto BO = MatchBinaryOp(TV, getDataLayout(), AC, DT, PN)) {
+        if (BO->Opcode == Instruction::Add) {
+          if (BO->LHS == PN && L->isLoopInvariant(BO->RHS))
+            Step = getSCEV(BO->RHS);
+          else if (BO->RHS == PN && L->isLoopInvariant(BO->LHS))
+            Step = getSCEV(BO->LHS);
+        }
+      }
+
+      if (Step) {
+        const SCEV *CondSCEV = getSCEV(SelCond);
+        if (NegCond)
+          CondSCEV = getNotSCEV(CondSCEV);
+        const SCEV *StartVal = getSCEV(StartValueV);
+        const SCEV *PHISCEV =
+            getConditionalAddRecExpr(StartVal, CondSCEV, Step, L);
+        insertValueToMap(PN, PHISCEV);
+        return PHISCEV;
+      }
+    }
+  }
+
   // Handle PHI node value symbolically.
   const SCEV *SymbolicName = getUnknown(PN);
   insertValueToMap(PN, SymbolicName);
@@ -6538,6 +6643,15 @@ APInt ScalarEvolution::getConstantMultipleImpl(const SCEV *S,
       TZ = std::min(TZ, getMinTrailingZeros(Operand, CtxI));
     return GetShiftedByZeros(TZ);
   }
+  case scConditionalAddRec: {
+    // The minimum trailing zeros of a conditional AddRec is the minimum of
+    // Start and Step (since the value is either Start or Start+k*Step).
+    const SCEVConditionalAddRecExpr *CAR =
+        cast<SCEVConditionalAddRecExpr>(S);
+    uint32_t TZ = std::min(getMinTrailingZeros(CAR->getStart(), CtxI),
+                           getMinTrailingZeros(CAR->getStep(), CtxI));
+    return GetShiftedByZeros(TZ);
+  }
   case scUMaxExpr:
   case scSMaxExpr:
   case scUMinExpr:
@@ -6797,6 +6911,7 @@ ScalarEvolution::getRangeRefIter(const SCEV *S,
     case scMulExpr:
     case scUDivExpr:
     case scAddRecExpr:
+    case scConditionalAddRec:
     case scUMaxExpr:
     case scSMaxExpr:
     case scUMinExpr:
@@ -7041,6 +7156,22 @@ const ConstantRange &ScalarEvolution::getRangeRef(
     }
 
     return setRange(AddRec, SignHint, std::move(ConservativeResult));
+  }
+  case scConditionalAddRec: {
+    const SCEVConditionalAddRecExpr *CAR =
+        cast<SCEVConditionalAddRecExpr>(S);
+    // If Step is non-negative, Start is an unsigned lower bound on the value:
+    // the recurrence only ever adds a non-negative quantity. The [Min, 0)
+    // wrap-around range encodes "all values >= Min".
+    if (SignHint == HINT_RANGE_UNSIGNED &&
+        getRangeRef(CAR->getStep(), SignHint, Depth + 1).isAllNonNegative()) {
+      APInt Min = getRangeRef(CAR->getStart(), SignHint, Depth + 1)
+                      .getUnsignedMin();
+      if (!Min.isZero())
+        ConservativeResult = ConservativeResult.intersectWith(
+            ConstantRange(Min, APInt(BitWidth, 0)), RangeType);
+    }
+    return setRange(CAR, SignHint, std::move(ConservativeResult));
   }
   case scUMaxExpr:
   case scSMaxExpr:
@@ -10152,6 +10283,7 @@ static Constant *BuildConstantFromSCEV(const SCEV *V) {
   switch (V->getSCEVType()) {
   case scCouldNotCompute:
   case scAddRecExpr:
+  case scConditionalAddRec:
   case scVScale:
     return nullptr;
   case scConstant:
@@ -10227,6 +10359,11 @@ const SCEV *ScalarEvolution::getWithOperands(const SCEV *S,
   case scAddRecExpr: {
     auto *AddRec = cast<SCEVAddRecExpr>(S);
     return getAddRecExpr(NewOps, AddRec->getLoop(), AddRec->getNoWrapFlags());
+  }
+  case scConditionalAddRec: {
+    auto *CAR = cast<SCEVConditionalAddRecExpr>(S);
+    return getConditionalAddRecExpr(NewOps[0], NewOps[1], NewOps[2],
+                                    CAR->getLoop());
   }
   case scAddExpr:
     return getAddExpr(NewOps, cast<SCEVAddExpr>(S)->getNoWrapFlags());
@@ -10445,6 +10582,9 @@ const SCEV *ScalarEvolution::computeSCEVAtScope(const SCEV *V, const Loop *L) {
       return V;
     return getSCEV(C);
   }
+  case scConditionalAddRec:
+    // Conservative: can't fold conditional AddRec to a value at scope yet.
+    return V;
   case scCouldNotCompute:
     llvm_unreachable("Attempt to use a SCEVCouldNotCompute object!");
   }
@@ -14391,6 +14531,31 @@ ScalarEvolution::computeLoopDisposition(const SCEV *S, const Loop *L) {
     // Otherwise it's loop-invariant.
     return LoopInvariant;
   }
+  case scConditionalAddRec: {
+    const SCEVConditionalAddRecExpr *CAR = cast<SCEVConditionalAddRecExpr>(S);
+
+    // If L is the recurrence's own loop, it's computable.
+    if (CAR->getLoop() == L)
+      return LoopComputable;
+
+    if (!L)
+      return LoopVariant;
+
+    if (DT.dominates(L->getHeader(), CAR->getLoop()->getHeader()))
+      return LoopVariant;
+    assert(!L->contains(CAR->getLoop()) &&
+           "Containing loop's header does not dominate the contained loop's?");
+
+    if (CAR->getLoop()->contains(L))
+      return LoopInvariant;
+
+    // Variant if Start, Cond, or Step are variant w.r.t. L.
+    for (SCEVUse Op : CAR->operands())
+      if (!isLoopInvariant(Op, L))
+        return LoopVariant;
+
+    return LoopInvariant;
+  }
   case scTruncate:
   case scZeroExtend:
   case scSignExtend:
@@ -14461,6 +14626,20 @@ ScalarEvolution::computeBlockDisposition(const SCEV *S, const BasicBlock *BB) {
   case scConstant:
   case scVScale:
     return ProperlyDominatesBlock;
+  case scConditionalAddRec: {
+    const SCEVConditionalAddRecExpr *CAR = cast<SCEVConditionalAddRecExpr>(S);
+    if (!DT.dominates(CAR->getLoop()->getHeader(), BB))
+      return DoesNotDominateBlock;
+    bool Proper = true;
+    for (const SCEV *Op : CAR->operands()) {
+      BlockDisposition D = getBlockDisposition(Op, BB);
+      if (D == DoesNotDominateBlock)
+        return DoesNotDominateBlock;
+      if (D == DominatesBlock)
+        Proper = false;
+    }
+    return Proper ? ProperlyDominatesBlock : DominatesBlock;
+  }
   case scAddRecExpr: {
     // This uses a "dominates" query instead of "properly dominates" query
     // to test for proper dominance too, because the instruction which

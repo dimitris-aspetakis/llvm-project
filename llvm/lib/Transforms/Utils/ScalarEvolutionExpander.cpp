@@ -464,6 +464,7 @@ const Loop *SCEVExpander::getRelevantLoop(const SCEV *S) {
   case scMulExpr:
   case scUDivExpr:
   case scAddRecExpr:
+  case scConditionalAddRec:
   case scUMaxExpr:
   case scSMaxExpr:
   case scUMinExpr:
@@ -472,6 +473,8 @@ const Loop *SCEVExpander::getRelevantLoop(const SCEV *S) {
     const Loop *L = nullptr;
     if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(S))
       L = AR->getLoop();
+    else if (const auto *CAR = dyn_cast<SCEVConditionalAddRecExpr>(S))
+      L = CAR->getLoop();
     for (const SCEV *Op : S->operands())
       L = PickMostRelevantLoop(L, getRelevantLoop(Op), SE.DT);
     return RelevantLoops[S] = L;
@@ -2083,6 +2086,22 @@ template<typename T> static InstructionCost costAndCollectOperands(
       Worklist.emplace_back(Instruction::Add, 1, Op);
     break;
   }
+  case scConditionalAddRec: {
+    // A conditional addrec expands to a phi, a conditional add (modeled as a
+    // select on the mask), and the step add: PHI + Add + Select.
+    Type *Ty = S->getType();
+    Cost += TTI.getCFInstrCost(Instruction::PHI, CostKind);
+    Cost += TTI.getArithmeticInstrCost(Instruction::Add, Ty, CostKind);
+    Cost += TTI.getCmpSelInstrCost(Instruction::Select, Ty,
+                                   CmpInst::makeCmpResultType(Ty),
+                                   CmpInst::BAD_ICMP_PREDICATE, CostKind);
+    // [Start, Cond, Step] — Start feeds the phi, Step the add, Cond the
+    // select.
+    Worklist.emplace_back(Instruction::PHI, 0, S->getOperand(0));
+    Worklist.emplace_back(Instruction::Select, 0, S->getOperand(1));
+    Worklist.emplace_back(Instruction::Add, 1, S->getOperand(2));
+    break;
+  }
   }
 
   for (auto &CostOp : Operations) {
@@ -2181,6 +2200,11 @@ bool SCEVExpander::isHighCostExpansionHelper(
     assert(cast<SCEVAddRecExpr>(S)->getNumOperands() >= 2 &&
            "Polynomial should be at least linear");
     Cost += costAndCollectOperands<SCEVAddRecExpr>(
+        WorkItem, TTI, CostKind, Worklist);
+    return Cost > Budget;
+  }
+  case scConditionalAddRec: {
+    Cost += costAndCollectOperands<SCEVConditionalAddRecExpr>(
         WorkItem, TTI, CostKind, Worklist);
     return Cost > Budget;
   }

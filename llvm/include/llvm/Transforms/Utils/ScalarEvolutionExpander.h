@@ -528,6 +528,11 @@ private:
 
   Value *visitSequentialUMinExpr(SCEVUseT<const SCEVSequentialUMinExpr *> S);
 
+  Value *visitConditionalAddRecExpr(
+      SCEVUseT<const SCEVConditionalAddRecExpr *> S) {
+    llvm_unreachable("SCEVExpander cannot expand SCEVConditionalAddRecExpr");
+  }
+
   Value *visitUnknown(SCEVUseT<const SCEVUnknown *> S) { return S->getValue(); }
 
   LLVM_ABI void rememberInstruction(Value *I);

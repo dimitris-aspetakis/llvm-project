@@ -59,6 +59,9 @@ public:
   void visitSequentialUMinExpr(const SCEVSequentialUMinExpr *Numerator) {}
   void visitUnknown(const SCEVUnknown *Numerator) {}
   void visitCouldNotCompute(const SCEVCouldNotCompute *Numerator) {}
+  void visitConditionalAddRecExpr(const SCEVConditionalAddRecExpr *Numerator) {
+    cannotDivide(Numerator);
+  }
 
   void visitConstant(const SCEVConstant *Numerator);
 

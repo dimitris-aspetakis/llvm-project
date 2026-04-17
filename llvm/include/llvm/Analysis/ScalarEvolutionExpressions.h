@@ -47,6 +47,7 @@ enum SCEVTypes : unsigned short {
   scMulExpr,
   scUDivExpr,
   scAddRecExpr,
+  scConditionalAddRec,
   scUMaxExpr,
   scSMaxExpr,
   scUMinExpr,
@@ -439,6 +440,54 @@ public:
   }
 };
 
+/// This node represents a polynomial recurrence on the trip count of the
+/// specified loop whose step is gated by a per-iteration boolean condition.
+///
+/// Semantics: after \p i iterations of \p Loop, the value equals
+///   Start + Step * |{ k : 0 <= k < i, Cond(k) != 0 }|
+///
+/// In other words, the recurrence advances by \p Step only on iterations
+/// where \p Cond is non-zero (true).  When \p Cond is always true this
+/// degenerates to an ordinary SCEVAddRecExpr.
+///
+/// Operand layout: [0] = Start, [1] = Cond (i1-typed), [2] = Step.
+/// Both Start and Step must be loop-invariant with respect to \p Loop.
+class SCEVConditionalAddRecExpr : public SCEV {
+  friend class ScalarEvolution;
+
+  const Loop *L;
+  std::array<SCEVUse, 3> Operands; // [Start, Cond, Step]
+
+  SCEVConditionalAddRecExpr(const FoldingSetNodeIDRef ID, SCEVUse Start,
+                            SCEVUse Cond, SCEVUse Step, const Loop *L)
+      : SCEV(ID, scConditionalAddRec,
+             computeExpressionSize({Start, Cond, Step})),
+        L(L) {
+    Operands[0] = Start;
+    Operands[1] = Cond;
+    Operands[2] = Step;
+  }
+
+public:
+  SCEVUse getStart() const { return Operands[0]; }
+  SCEVUse getCond() const { return Operands[1]; }
+  SCEVUse getStep() const { return Operands[2]; }
+  const Loop *getLoop() const { return L; }
+
+  Type *getType() const { return getStart()->getType(); }
+
+  size_t getNumOperands() const { return 3; }
+  SCEVUse getOperand(unsigned i) const {
+    assert(i < 3 && "Operand index out of range!");
+    return Operands[i];
+  }
+  ArrayRef<SCEVUse> operands() const { return Operands; }
+
+  static bool classof(const SCEV *S) {
+    return S->getSCEVType() == scConditionalAddRec;
+  }
+};
+
 /// This node is the base class min/max selections.
 class SCEVMinMaxExpr : public SCEVCommutativeExpr {
   friend class ScalarEvolution;
@@ -652,6 +701,9 @@ template <typename SC, typename RetVal = void> struct SCEVVisitor {
       return ((SC *)this)->visitUDivExpr((const SCEVUDivExpr *)S);
     case scAddRecExpr:
       return ((SC *)this)->visitAddRecExpr((const SCEVAddRecExpr *)S);
+    case scConditionalAddRec:
+      return ((SC *)this)->visitConditionalAddRecExpr(
+          (const SCEVConditionalAddRecExpr *)S);
     case scSMaxExpr:
       return ((SC *)this)->visitSMaxExpr((const SCEVSMaxExpr *)S);
     case scUMaxExpr:
@@ -710,6 +762,9 @@ template <typename SC, typename RetVal = void> struct SCEVUseVisitor {
     case scAddRecExpr:
       return ((SC *)this)
           ->visitAddRecExpr(cast<SCEVUseT<const SCEVAddRecExpr *>>(S));
+    case scConditionalAddRec:
+      return ((SC *)this)->visitConditionalAddRecExpr(
+          cast<SCEVUseT<const SCEVConditionalAddRecExpr *>>(S));
     case scSMaxExpr:
       return ((SC *)this)
           ->visitSMaxExpr(cast<SCEVUseT<const SCEVSMaxExpr *>>(S));
@@ -784,6 +839,7 @@ public:
       case scSMinExpr:
       case scUMinExpr:
       case scSequentialUMinExpr:
+      case scConditionalAddRec:
       case scAddRecExpr:
         for (const SCEV *Op : S->operands()) {
           push(Op);
@@ -931,6 +987,18 @@ public:
     return !Changed ? Expr
                     : SE.getAddRecExpr(Operands, Expr->getLoop(),
                                        Expr->getNoWrapFlags());
+  }
+
+  const SCEV *
+  visitConditionalAddRecExpr(const SCEVConditionalAddRecExpr *Expr) {
+    const SCEV *Start = ((SC *)this)->visit(Expr->getStart());
+    const SCEV *Cond = ((SC *)this)->visit(Expr->getCond());
+    const SCEV *Step = ((SC *)this)->visit(Expr->getStep());
+    bool Changed = Start != Expr->getStart() || Cond != Expr->getCond() ||
+                   Step != Expr->getStep();
+    return !Changed
+               ? Expr
+               : SE.getConditionalAddRecExpr(Start, Cond, Step, Expr->getLoop());
   }
 
   const SCEV *visitSMaxExpr(const SCEVSMaxExpr *Expr) {

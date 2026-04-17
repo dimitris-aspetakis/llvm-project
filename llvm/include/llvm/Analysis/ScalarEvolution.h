@@ -803,6 +803,16 @@ public:
     return getAddRecExpr(NewOp, L, Flags);
   }
 
+  /// Create or retrieve a SCEVConditionalAddRecExpr representing
+  /// {Start, +[Cond], Step}[L]: a recurrence that advances by Step only on
+  /// iterations where Cond (an i1-typed SCEV) is non-zero.
+  /// Constant-folds to SCEVAddRecExpr when Cond is always-true, or to Start
+  /// when Cond is always-false.
+  LLVM_ABI const SCEV *getConditionalAddRecExpr(const SCEV *Start,
+                                                const SCEV *Cond,
+                                                const SCEV *Step,
+                                                const Loop *L);
+
   /// Checks if \p SymbolicPHI can be rewritten as an AddRecExpr under some
   /// Predicates. If successful return these <AddRecExpr, Predicates>;
   /// The function is intended to be called from PSCEV (the caller will decide
@@ -2510,7 +2520,7 @@ private:
   BumpPtrAllocator SCEVAllocator;
 
   /// This maps loops to a list of addrecs that directly use said loop.
-  DenseMap<const Loop *, SmallVector<const SCEVAddRecExpr *, 4>> LoopUsers;
+  DenseMap<const Loop *, SmallVector<const SCEV *, 4>> LoopUsers;
 
   /// Cache tentative mappings from UnknownSCEVs in a Loop, to a SCEV expression
   /// they can be rewritten into under certain predicates.
