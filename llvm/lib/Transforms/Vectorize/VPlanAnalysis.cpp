@@ -291,18 +291,20 @@ Type *VPTypeAnalysis::inferScalarType(const VPValue *V) {
       TypeSwitch<const VPRecipeBase *, Type *>(V->getDefiningRecipe())
           .Case<VPActiveLaneMaskPHIRecipe, VPFirstOrderRecurrencePHIRecipe,
                 VPReductionPHIRecipe, VPWidenPointerInductionRecipe,
-                VPCurrentIterationPHIRecipe>([this](const auto *R) {
-            // Handle header phi recipes, except VPWidenIntOrFpInduction
-            // which needs special handling due it being possibly truncated.
-            // TODO: consider inferring/caching type of siblings, e.g.,
-            // backedge value, here and in cases below.
-            return inferScalarType(R->getStartValue());
-          })
+                VPCurrentIterationPHIRecipe, VPCompressStorePHIRecipe>(
+              [this](const auto *R) {
+                // Handle header phi recipes, except VPWidenIntOrFpInduction
+                // which needs special handling due it being possibly truncated.
+                // TODO: consider inferring/caching type of siblings, e.g.,
+                // backedge value, here and in cases below.
+                return inferScalarType(R->getStartValue());
+              })
           .Case<VPWidenIntOrFpInductionRecipe, VPDerivedIVRecipe>(
               [](const auto *R) { return R->getScalarType(); })
           .Case<VPReductionRecipe, VPPredInstPHIRecipe, VPWidenPHIRecipe,
                 VPScalarIVStepsRecipe, VPWidenGEPRecipe, VPVectorPointerRecipe,
-                VPVectorEndPointerRecipe, VPWidenCanonicalIVRecipe>(
+                VPVectorEndPointerRecipe, VPWidenCanonicalIVRecipe,
+                VPCompressStoreRecipe>(
               [this](const VPRecipeBase *R) {
                 return inferScalarType(R->getOperand(0));
               })

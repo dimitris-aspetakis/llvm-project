@@ -1064,7 +1064,8 @@ void VPlan::execute(VPTransformState *State) {
     // VPInstructions currently model scalar Phis only.
     bool NeedsScalar = isa<VPInstruction>(PhiR) ||
                        (isa<VPReductionPHIRecipe>(PhiR) &&
-                        cast<VPReductionPHIRecipe>(PhiR)->isInLoop());
+                        cast<VPReductionPHIRecipe>(PhiR)->isInLoop()) ||
+                       isa<VPCompressStorePHIRecipe>(PhiR);
 
     Value *Phi = State->get(PhiR, NeedsScalar);
     // VPHeaderPHIRecipe supports getBackedgeValue() but VPInstruction does

@@ -291,8 +291,15 @@ void UnrollState::unrollHeaderPHIByUF(VPHeaderPHIRecipe *R,
           VPV2Parts[VPI][Part - 1] = StartV;
       }
     } else {
+      // VPCompressStorePHIRecipe would land here too if the cost model
+      // hadn't clamped IC=1 for loops that contain one (see
+      // selectInterleaveCount). A user bypass via
+      // -force-vector-interleave=N is the only way to reach this point
+      // with a compress-store phi; the assertion message calls that out.
       assert(isa<VPActiveLaneMaskPHIRecipe>(R) &&
-             "unexpected header phi recipe not needing unrolled part");
+             "unexpected header phi recipe not needing unrolled part "
+             "(VPCompressStorePHIRecipe should have been clamped to "
+             "UF=1 by selectInterleaveCount)");
     }
   }
 }

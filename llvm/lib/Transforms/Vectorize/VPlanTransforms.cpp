@@ -6621,6 +6621,11 @@ void VPlanTransforms::makeMemOpWideningDecisions(
       continue;
     }
 
+    if (VPCompressStoreRecipe *CS = RecipeBuilder.widenIfCompressStore(VPI)) {
+      ReplaceWith(CS);
+      continue;
+    }
+
     VPRecipeBase *Recipe = RecipeBuilder.tryToWidenMemory(VPI, Range);
     if (!Recipe)
       Recipe = RecipeBuilder.handleReplication(VPI, Range);

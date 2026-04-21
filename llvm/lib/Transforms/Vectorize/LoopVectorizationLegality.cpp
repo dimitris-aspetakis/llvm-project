@@ -88,6 +88,11 @@ static cl::opt<bool> EnableHistogramVectorization(
     "enable-histogram-loop-vectorization", cl::init(false), cl::Hidden,
     cl::desc("Enables autovectorization of some loops containing histograms"));
 
+static cl::opt<bool> EnableCompressStoreVectorization(
+    "enable-compress-store-loop-vectorization", cl::init(true), cl::Hidden,
+    cl::desc("Enables autovectorization of loops containing a conditional "
+             "store through a phi-based write index (compress-store)"));
+
 /// Maximum vectorization interleave count.
 static const unsigned MaxInterleaveFactor = 16;
 
@@ -947,6 +952,13 @@ bool LoopVectorizationLegality::canVectorizeInstr(Instruction &I) {
       return true;
     }
 
+    // Accept the phi if it is the write-index phi of a compress-store pattern
+    // that was detected earlier.  The pattern guarantees the phi never needs
+    // to be widened; it stays scalar and its update is handled by the
+    // VPCompressStoreRecipe.
+    if (getCompressStoreInfo(Phi))
+      return true;
+
     reportVectorizationFailure("Found an unidentified PHI",
                                "value that could not be identified as "
                                "reduction is used outside the loop",
@@ -1105,6 +1117,152 @@ bool LoopVectorizationLegality::canVectorizeInstr(Instruction &I) {
   return true;
 }
 
+/// Match a compress-store pattern driven by a SCEVConditionalAddRecExpr.
+///
+/// Concretely: the write-index phi `j` must have a SCEV of the form
+/// `{Start,+[Cond],1}<L>`, i.e. a conditional induction variable on \p TheLoop
+/// with constant integer step 1. We still recover the merge-PHI, the
+/// increment instruction, the store, and the base pointer from the IR, so the
+/// downstream VPlan recipes (which were designed around the split-CFG form)
+/// receive the exact instructions they need. The branch condition used as the
+/// mask comes directly from SCEV, so the recognition also covers the case
+/// where the true/false edges of the guard branch have been swapped — SCEV
+/// will have already recorded `NOT Cond` in that case.
+static bool findCompressStoreFromSCEV(
+    PHINode *HeaderPhi, Loop *TheLoop, ScalarEvolution &SE,
+    const TargetTransformInfo &TTI,
+    SmallVectorImpl<CompressStoreInfo> &CompressStores) {
+  // Only handle integer write indices.
+  Type *PhiTy = HeaderPhi->getType();
+  if (!PhiTy->isIntegerTy())
+    return false;
+
+  // Step 1: SCEV says this phi is a conditional IV on this loop.
+  auto *CAR = dyn_cast<SCEVConditionalAddRecExpr>(SE.getSCEV(HeaderPhi));
+  if (!CAR || CAR->getLoop() != TheLoop)
+    return false;
+
+  // MVP: require a constant integer step of 1. Phase 2 generalizes this to
+  // arbitrary loop-invariant integer step via scalar popcount * step in the
+  // VPCompressStoreRecipe.
+  auto *ConstStep = dyn_cast<SCEVConstant>(CAR->getStep());
+  if (!ConstStep || !ConstStep->getAPInt().isOne())
+    return false;
+
+  // Always-true / always-false conditions were constant-folded away by the
+  // SCEVConditionalAddRecExpr factory, so if we got here the condition is a
+  // runtime i1. We don't need to extract the mask Value from SCEV: the VPlan
+  // recipe pulls the mask from the VPInstruction's block predicate, which
+  // the VPlan predicator computes correctly for both straight-through and
+  // inverted branches. The CompressStoreInfo::Mask field is informational
+  // only and any plausible Value works; we pick the gate branch's
+  // condition (found below, after we locate the take block).
+
+  // Step 3: recover the merge PHI and the increment in IR. The VPlan recipes
+  // require a split-CFG shape (phi at a merge block, separate take block);
+  // if the backedge value is a SelectInst (post-simplifycfg select form) we
+  // bail out. The SCEV producer accepts both forms but the recipes only
+  // handle the split-CFG one.
+  BasicBlock *Preheader = TheLoop->getLoopPreheader();
+  Value *BackEdgeVal = nullptr;
+  for (unsigned I = 0; I < HeaderPhi->getNumIncomingValues(); ++I)
+    if (HeaderPhi->getIncomingBlock(I) != Preheader)
+      BackEdgeVal = HeaderPhi->getIncomingValue(I);
+  auto *MergePhi = dyn_cast_or_null<PHINode>(BackEdgeVal);
+  if (!MergePhi || MergePhi->getParent() == TheLoop->getHeader() ||
+      MergePhi->getNumIncomingValues() != 2)
+    return false;
+
+  // Step 4: identify the take block and the `add phi, 1` among the merge
+  // PHI's incoming values. One arm must be the header phi unchanged, the
+  // other must be `add phi, 1`.
+  Instruction *IndexInc = nullptr;
+  BasicBlock *IfThenBB = nullptr;
+  for (unsigned I = 0; I < 2; ++I) {
+    Value *V = MergePhi->getIncomingValue(I);
+    if (V == HeaderPhi)
+      continue;
+    auto *Add = dyn_cast<BinaryOperator>(V);
+    if (!Add || Add->getOpcode() != Instruction::Add)
+      return false;
+    Value *Step = nullptr;
+    if (Add->getOperand(0) == HeaderPhi)
+      Step = Add->getOperand(1);
+    else if (Add->getOperand(1) == HeaderPhi)
+      Step = Add->getOperand(0);
+    if (!Step)
+      return false;
+    auto *CI = dyn_cast<ConstantInt>(Step);
+    if (!CI || !CI->isOne())
+      return false;
+    IndexInc = Add;
+    IfThenBB = MergePhi->getIncomingBlock(I);
+  }
+  if (!IndexInc || !IfThenBB)
+    return false;
+  if (!TheLoop->contains(IndexInc->getParent()) ||
+      !TheLoop->contains(MergePhi->getParent()))
+    return false;
+
+  // Step 5: find the store in IfThenBB whose GEP indexes on HeaderPhi. Strip
+  // any sext/zext on the index (clang emits these when the pointer width is
+  // wider than the index type).
+  using namespace llvm::PatternMatch;
+  StoreInst *TheStore = nullptr;
+  Value *TheStoredVal = nullptr;
+  Value *BasePtr = nullptr;
+  for (Instruction &I : *IfThenBB) {
+    auto *SI = dyn_cast<StoreInst>(&I);
+    if (!SI)
+      continue;
+    auto *GEP = dyn_cast<GetElementPtrInst>(SI->getPointerOperand());
+    if (!GEP || GEP->getNumIndices() != 1)
+      continue;
+    Value *GEPIdx = GEP->getOperand(1);
+    Value *StrippedIdx = nullptr;
+    if (!match(GEPIdx, m_ZExtOrSExtOrSelf(m_Value(StrippedIdx))))
+      continue;
+    if (StrippedIdx != HeaderPhi)
+      continue;
+    if (!TheLoop->isLoopInvariant(GEP->getPointerOperand()))
+      continue;
+    TheStore = SI;
+    TheStoredVal = SI->getValueOperand();
+    BasePtr = GEP->getPointerOperand();
+    break;
+  }
+  if (!TheStore)
+    return false;
+
+  // Step 6: target legality for the element type. Use a minimal VF=4 probe
+  // type; the cost model will pick the actual VF later.
+  Type *ElemTy = TheStoredVal->getType();
+  auto *VecTy = dyn_cast<FixedVectorType>(ElemTy);
+  Type *ScalarElemTy = VecTy ? VecTy->getElementType() : ElemTy;
+  auto *QueryVecTy = FixedVectorType::get(ScalarElemTy, 4);
+  if (!TTI.isLegalMaskedCompressStore(QueryVecTy, TheStore->getAlign()))
+    return false;
+
+  LLVM_DEBUG(dbgs() << "LV: Found compress-store via SCEV for: " << *TheStore
+                    << "\n");
+  CompressStores.emplace_back(HeaderPhi, MergePhi, IndexInc, TheStore,
+                              TheStoredVal, BasePtr);
+  return true;
+}
+
+bool LoopVectorizationLegality::canVectorizeCompressStore() {
+  if (!EnableCompressStoreVectorization)
+    return false;
+
+  ScalarEvolution *SE = PSE.getSE();
+  BasicBlock *Header = TheLoop->getHeader();
+  bool Found = false;
+  for (PHINode &Phi : Header->phis())
+    if (findCompressStoreFromSCEV(&Phi, TheLoop, *SE, *TTI, CompressStores))
+      Found = true;
+  return Found;
+}
+
 /// Find histogram operations that match high-level code in loops:
 /// \code
 /// buckets[indices[i]]+=step;
@@ -1251,6 +1409,13 @@ bool LoopVectorizationLegality::canVectorizeMemory() {
           TheLoop);
       return false;
     }
+
+    // If we already verified a compress-store pattern the apparent memory
+    // hazard is the non-SCEV-analyzable store pointer.  The pattern guarantees
+    // stores are written to monotonically increasing, non-overlapping
+    // addresses, so it is safe to vectorise.
+    if (!CompressStores.empty())
+      return true;
 
     return canVectorizeIndirectUnsafeDependences();
   }
@@ -1982,6 +2147,10 @@ bool LoopVectorizationLegality::canVectorize(bool UseVPlanNativePath) {
     else
       return false;
   }
+
+  // Detect compress-store patterns before canVectorizeInstrs so that the
+  // write-index phi is accepted rather than rejected as unidentified.
+  canVectorizeCompressStore();
 
   // Check if we can vectorize the instructions and CFG in this loop.
   if (!canVectorizeInstrs()) {

@@ -722,8 +722,9 @@ void VPlanTransforms::createHeaderPhiRecipes(
     const MapVector<PHINode *, InductionDescriptor> &Inductions,
     const MapVector<PHINode *, RecurrenceDescriptor> &Reductions,
     const SmallPtrSetImpl<const PHINode *> &FixedOrderRecurrences,
-    const SmallPtrSetImpl<PHINode *> &InLoopReductions, bool AllowReordering) {
-  // Retrieve the header manually from the intial plain-CFG VPlan.
+    const SmallPtrSetImpl<PHINode *> &InLoopReductions, bool AllowReordering,
+    ArrayRef<PHINode *> CompressStoreIndexPhis) {
+  // Retrieve the header manually from the initial plain-CFG VPlan.
   VPBasicBlock *HeaderVPBB = cast<VPBasicBlock>(
       Plan.getEntry()->getSuccessors()[1]->getSingleSuccessor());
   assert(VPDominatorTree(Plan).dominates(HeaderVPBB,
@@ -754,6 +755,15 @@ void VPlanTransforms::createHeaderPhiRecipes(
       return createWidenInductionRecipe(Phi, PhiR, Start, InductionIt->second,
                                         Plan, PSE, OrigLoop,
                                         PhiR->getDebugLoc());
+
+    // Compress-store write-index phi: create a scalar header phi whose
+    // back-edge will be updated to VPCompressStoreRecipe by
+    // tryToWidenCompressStore once the recipe for the store is built.
+    if (llvm::is_contained(CompressStoreIndexPhis, Phi)) {
+      auto *R = new VPCompressStorePHIRecipe(Phi, *Start, PhiR->getDebugLoc());
+      R->addOperand(BackedgeValue);
+      return R;
+    }
 
     assert(Reductions.contains(Phi) && "only reductions are expected now");
     const RecurrenceDescriptor &RdxDesc = Reductions.lookup(Phi);

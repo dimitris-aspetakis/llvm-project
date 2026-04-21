@@ -448,6 +448,7 @@ public:
     VPWidenSC,
     VPBlendSC,
     VPHistogramSC,
+    VPCompressStoreSC,
     // START: Phi-like recipes. Need to be kept together.
     VPWidenPHISC,
     VPPredInstPHISC,
@@ -459,12 +460,13 @@ public:
     VPWidenIntOrFpInductionSC,
     VPWidenPointerInductionSC,
     VPReductionPHISC,
+    VPCompressStorePHISC,
     // END: SubclassID for recipes that inherit VPHeaderPHIRecipe
     // END: Phi-like recipes
     VPFirstPHISC = VPWidenPHISC,
     VPFirstHeaderPHISC = VPCurrentIterationPHISC,
-    VPLastHeaderPHISC = VPReductionPHISC,
-    VPLastPHISC = VPReductionPHISC,
+    VPLastHeaderPHISC = VPCompressStorePHISC,
+    VPLastPHISC = VPCompressStorePHISC,
   };
 
   VPRecipeBase(const unsigned char SC, ArrayRef<VPValue *> Operands,
@@ -640,6 +642,7 @@ public:
     case VPRecipeBase::VPWidenIntOrFpInductionSC:
     case VPRecipeBase::VPWidenPointerInductionSC:
     case VPRecipeBase::VPReductionPHISC:
+    case VPRecipeBase::VPCompressStorePHISC:
       return true;
     case VPRecipeBase::VPBranchOnMaskSC:
     case VPRecipeBase::VPInterleaveEVLSC:
@@ -650,6 +653,7 @@ public:
     case VPRecipeBase::VPWidenStoreEVLSC:
     case VPRecipeBase::VPWidenStoreSC:
     case VPRecipeBase::VPHistogramSC:
+    case VPRecipeBase::VPCompressStoreSC:
       // TODO: Widened stores don't define a value, but widened loads do. Split
       // the recipes to be able to make widened loads VPSingleDefRecipes.
       return false;
@@ -3860,6 +3864,98 @@ protected:
   /// Print the recipe.
   LLVM_ABI_FOR_TEST void printRecipe(raw_ostream &O, const Twine &Indent,
                                      VPSlotTracker &SlotTracker) const override;
+#endif
+};
+
+/// A recipe that keeps the compress-store write-index scalar phi alive in the
+/// vector loop header.  It creates a simple scalar PHI whose back-edge value is
+/// the j_next produced by the associated VPCompressStoreRecipe.
+class VPCompressStorePHIRecipe : public VPHeaderPHIRecipe {
+public:
+  VPCompressStorePHIRecipe(PHINode *Phi, VPValue &StartV,
+                           DebugLoc DL = DebugLoc::getUnknown())
+      : VPHeaderPHIRecipe(VPRecipeBase::VPCompressStorePHISC, Phi, &StartV,
+                          DL) {}
+
+  ~VPCompressStorePHIRecipe() override = default;
+
+  VPCompressStorePHIRecipe *clone() override {
+    auto *R = new VPCompressStorePHIRecipe(
+        cast<PHINode>(getUnderlyingValue()), *getStartValue(), getDebugLoc());
+    R->addOperand(getBackedgeValue());
+    return R;
+  }
+
+  VP_CLASSOF_IMPL(VPRecipeBase::VPCompressStorePHISC)
+
+  void execute(VPTransformState &State) override;
+
+  InstructionCost computeCost(ElementCount VF,
+                              VPCostContext &Ctx) const override {
+    return 0;
+  }
+
+  bool usesFirstLaneOnly(const VPValue *Op) const override {
+    assert(is_contained(operands(), Op) && "Op must be an operand of the recipe");
+    return true;
+  }
+
+  bool usesFirstPartOnly(const VPValue *Op) const override {
+    assert(is_contained(operands(), Op) && "Op must be an operand of the recipe");
+    return true;
+  }
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+  void printRecipe(raw_ostream &O, const Twine &Indent,
+                   VPSlotTracker &SlotTracker) const override;
+#endif
+};
+
+/// A recipe that emits a masked compress-store and produces the updated scalar
+/// write-index j_next = j_old + popcount(mask).
+///
+/// Operands: [0] = j_old (scalar, from VPCompressStorePHIRecipe)
+///           [1] = base pointer (loop-invariant scalar)
+///           [2] = value to store (vector)
+///           [3] = mask (vector)
+class VPCompressStoreRecipe : public VPSingleDefRecipe {
+  Align Alignment;
+
+public:
+  VPCompressStoreRecipe(VPValue *JOld, VPValue *BasePtr, VPValue *StoredVal,
+                        VPValue *Mask, Align Alignment,
+                        DebugLoc DL = DebugLoc::getUnknown())
+      : VPSingleDefRecipe(VPRecipeBase::VPCompressStoreSC,
+                          {JOld, BasePtr, StoredVal, Mask}, DL),
+        Alignment(Alignment) {}
+
+  ~VPCompressStoreRecipe() override = default;
+
+  VPCompressStoreRecipe *clone() override {
+    return new VPCompressStoreRecipe(getJOld(), getBasePtr(), getStoredVal(),
+                                     getMask(), Alignment, getDebugLoc());
+  }
+
+  VP_CLASSOF_IMPL(VPRecipeBase::VPCompressStoreSC)
+
+  VPValue *getJOld() const { return getOperand(0); }
+  VPValue *getBasePtr() const { return getOperand(1); }
+  VPValue *getStoredVal() const { return getOperand(2); }
+  VPValue *getMask() const { return getOperand(3); }
+
+  void execute(VPTransformState &State) override;
+
+  InstructionCost computeCost(ElementCount VF, VPCostContext &Ctx) const override;
+
+  bool usesFirstLaneOnly(const VPValue *Op) const override {
+    assert(is_contained(operands(), Op) && "Op must be an operand of the recipe");
+    // j_old and base ptr are scalar; StoredVal and Mask are vector.
+    return Op == getJOld() || Op == getBasePtr();
+  }
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+  void printRecipe(raw_ostream &O, const Twine &Indent,
+                   VPSlotTracker &SlotTracker) const override;
 #endif
 };
 

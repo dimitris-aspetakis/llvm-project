@@ -3434,6 +3434,8 @@ static bool willGenerateVectors(VPlan &Plan, ElementCount VF,
       case VPRecipeBase::VPBlendSC:
       case VPRecipeBase::VPFirstOrderRecurrencePHISC:
       case VPRecipeBase::VPHistogramSC:
+      case VPRecipeBase::VPCompressStoreSC:
+      case VPRecipeBase::VPCompressStorePHISC:
       case VPRecipeBase::VPWidenPHISC:
       case VPRecipeBase::VPWidenIntOrFpInductionSC:
       case VPRecipeBase::VPWidenPointerInductionSC:
@@ -3514,6 +3516,9 @@ static bool hasUnsupportedHeaderPhiRecipe(VPlan &Plan) {
       [](VPRecipeBase &R) {
         if (auto *WidenInd = dyn_cast<VPWidenIntOrFpInductionRecipe>(&R))
           return !WidenInd->getPHINode();
+        // Epilogue vectorization for compress-store is not yet implemented.
+        if (isa<VPCompressStorePHIRecipe>(&R))
+          return true;
         auto *RedPhi = dyn_cast<VPReductionPHIRecipe>(&R);
         if (!RedPhi)
           return false;
@@ -3810,6 +3815,12 @@ LoopVectorizationPlanner::selectInterleaveCount(VPlan &Plan, ElementCount VF,
   if (hasFindLastReductionPhi(Plan))
     return 1;
 
+  // FIXME: implement interleaving for compress-store loops correctly.
+  // VPCompressStorePHIRecipe has no per-part chaining logic in
+  // unrollHeaderPHIByUF, and naive cloning would produce wrong code.
+  if (Legal->hasCompressStores())
+    return 1;
+
   VPRegisterUsage R =
       calculateRegisterUsageForPlan(Plan, {VF}, TTI, CM.ValuesToIgnore)[0];
 
@@ -4024,6 +4035,10 @@ LoopVectorizationPlanner::selectInterleaveCount(VPlan &Plan, ElementCount VF,
         }
         if (isa<VPHistogramRecipe>(&R)) {
           NumLoads++;
+          NumStores++;
+          continue;
+        }
+        if (isa<VPCompressStoreRecipe>(&R)) {
           NumStores++;
           continue;
         }
@@ -6802,6 +6817,60 @@ bool VPRecipeBuilder::replaceWithFinalIfReductionStore(
   return false;
 }
 
+VPCompressStoreRecipe *
+VPRecipeBuilder::widenIfCompressStore(VPInstruction *VPI) {
+  if (VPI->getOpcode() != Instruction::Store)
+    return nullptr;
+
+  auto MaybeCSI =
+      Legal->getCompressStoreInfo(cast<StoreInst>(VPI->getUnderlyingInstr()));
+  if (!MaybeCSI)
+    return nullptr;
+  const CompressStoreInfo *CSI = *MaybeCSI;
+
+  VPBasicBlock *HeaderVPBB = Plan.getVectorLoopRegion()->getEntryBasicBlock();
+
+  VPCompressStorePHIRecipe *PhiRecipe = nullptr;
+  if (auto *Existing = Ingredient2Recipe.lookup(CSI->IndexPhi)) {
+    PhiRecipe = cast<VPCompressStorePHIRecipe>(Existing);
+  } else {
+    for (auto &R : HeaderVPBB->phis()) {
+      if (auto *CPR = dyn_cast<VPCompressStorePHIRecipe>(&R))
+        if (CPR->getUnderlyingInstr() == CSI->IndexPhi) {
+          PhiRecipe = CPR;
+          break;
+        }
+    }
+    if (PhiRecipe)
+      setRecipe(CSI->IndexPhi, PhiRecipe);
+  }
+  assert(PhiRecipe && "VPCompressStorePHIRecipe must exist in header");
+
+  VPValue *BasePtr = getVPValueOrAddLiveIn(CSI->BasePtr);
+  VPValue *StoredVal = getVPValueOrAddLiveIn(CSI->StoredVal);
+  VPValue *Mask = VPI->getMask();
+  assert(Mask && "compress-store expects a mask");
+
+  auto *CSRecipe = new VPCompressStoreRecipe(
+      PhiRecipe, BasePtr, StoredVal, Mask,
+      cast<StoreInst>(VPI->getUnderlyingInstr())->getAlign(),
+      VPI->getDebugLoc());
+
+  VPValue *OldBackedge = PhiRecipe->getBackedgeValue();
+  PhiRecipe->setBackedgeValue(CSRecipe);
+
+  for (VPUser *U : make_early_inc_range(OldBackedge->users())) {
+    auto *ExtractR = dyn_cast<VPInstruction>(U);
+    if (!ExtractR ||
+        ExtractR->getOpcode() != VPInstruction::ExtractLastPart)
+      continue;
+    ExtractR->replaceAllUsesWith(CSRecipe);
+    ExtractR->eraseFromParent();
+  }
+
+  return CSRecipe;
+}
+
 VPReplicateRecipe *VPRecipeBuilder::handleReplication(VPInstruction *VPI,
                                                       VFRange &Range) {
   auto *I = VPI->getUnderlyingInstr();
@@ -6892,6 +6961,13 @@ VPRecipeBuilder::tryToCreateWidenNonPhiRecipe(VPSingleDefRecipe *R,
                        VPI->getOpcode()) &&
          "Should have been handled prior to this!");
 
+  // Instructions that are part of a compress-store pattern (the write-index
+  // increment and the merge phi) must not be widened — they become dead after
+  // VPCompressStoreRecipe handles the store.  Return nullptr to force scalar
+  // replication.
+  if (Legal->getCompressStoreInfo(Instr))
+    return nullptr;
+
   if (!shouldWiden(Instr, Range))
     return nullptr;
 
@@ -6942,7 +7018,8 @@ void LoopVectorizationPlanner::buildVPlansWithVPRecipes(ElementCount MinVF,
   RUN_VPLAN_PASS(VPlanTransforms::createHeaderPhiRecipes, *VPlan0, PSE,
                  *OrigLoop, Legal->getInductionVars(),
                  Legal->getReductionVars(), Legal->getFixedOrderRecurrences(),
-                 Config.getInLoopReductions(), Hints.allowReordering());
+                 Config.getInLoopReductions(), Hints.allowReordering(),
+                 Legal->getCompressStoreIndexPhis());
 
   RUN_VPLAN_PASS(VPlanTransforms::simplifyRecipes, *VPlan0);
   // If we're vectorizing a loop with an uncountable exit, make sure that the
@@ -7110,7 +7187,7 @@ LoopVectorizationPlanner::tryToBuildVPlanWithVPRecipes(VPlanPtr Plan,
       if (isa<VPWidenCanonicalIVRecipe, VPBlendRecipe, VPReductionRecipe,
               VPReplicateRecipe, VPWidenLoadRecipe, VPWidenStoreRecipe,
               VPVectorPointerRecipe, VPVectorEndPointerRecipe,
-              VPHistogramRecipe>(&R))
+              VPHistogramRecipe, VPCompressStoreRecipe>(&R))
         continue;
       auto *VPI = cast<VPInstruction>(&R);
       if (!VPI->getUnderlyingValue())
@@ -8422,6 +8499,14 @@ bool LoopVectorizePass::processLoop(Loop *L) {
   unsigned UserIC = Hints.getInterleave();
   if (UserIC > 1 && !LVL.isSafeForAnyVectorWidth())
     UserIC = 1;
+  // FIXME: implement interleaving for compress-store loops correctly.
+  // VPCompressStorePHIRecipe has no per-part chaining logic in
+  // unrollHeaderPHIByUF; honoring a user-forced IC > 1 would crash on the
+  // assertion in VPlanUnroll.cpp. Match the cost-model clamp in
+  // selectInterleaveCount so the override at the bottom of this function
+  // ("IC = UserIC > 0 ? UserIC : IC") cannot reintroduce IC > 1.
+  if (UserIC > 1 && LVL.hasCompressStores())
+    UserIC = 1;
 
   // Plan how to best vectorize.
   LVP.plan(UserVF, UserIC);
@@ -8487,8 +8572,9 @@ bool LoopVectorizePass::processLoop(Loop *L) {
   }
 
   if (UserIC == 1 && Hints.getInterleave() > 1) {
-    assert(!LVL.isSafeForAnyVectorWidth() &&
-           "UserIC should only be ignored due to unsafe dependencies");
+    assert((!LVL.isSafeForAnyVectorWidth() || LVL.hasCompressStores()) &&
+           "UserIC should only be ignored due to unsafe dependencies or "
+           "compress-store loops");
     LLVM_DEBUG(dbgs() << "LV: Ignoring user-specified interleave count.\n");
     IntDiagMsg = {"InterleavingUnsafe",
                   "Ignoring user-specified interleave count due to possibly "

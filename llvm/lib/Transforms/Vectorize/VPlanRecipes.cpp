@@ -185,6 +185,7 @@ bool VPRecipeBase::mayHaveSideEffects() const {
   case VPWidenIntrinsicSC:
     return cast<VPWidenIntrinsicRecipe>(this)->mayHaveSideEffects();
   case VPBlendSC:
+  case VPCompressStorePHISC:
   case VPReductionEVLSC:
   case VPReductionSC:
   case VPScalarIVStepsSC:
@@ -216,6 +217,8 @@ bool VPRecipeBase::mayHaveSideEffects() const {
         "mayHaveSideffects result for ingredient differs from this "
         "implementation");
     return mayWriteToMemory();
+  case VPCompressStoreSC:
+    return true; // the compress-store writes to memory
   case VPReplicateSC: {
     auto *R = cast<VPReplicateRecipe>(this);
     return R->getUnderlyingInstr()->mayHaveSideEffects();
@@ -2095,6 +2098,98 @@ void VPHistogramRecipe::printRecipe(raw_ostream &O, const Twine &Indent,
     O << ", mask: ";
     Mask->printAsOperand(O, SlotTracker);
   }
+}
+#endif
+
+void VPCompressStorePHIRecipe::execute(VPTransformState &State) {
+  BasicBlock *VectorPH =
+      State.CFG.VPBB2IRBB.at(getParent()->getCFGPredecessor(0));
+  Value *StartV = State.get(getStartValue(), /*IsScalar=*/true);
+
+  BasicBlock *HeaderBB = State.CFG.PrevBB;
+  assert(State.CurrentParentLoop->getHeader() == HeaderBB &&
+         "recipe must be in the vector loop header");
+  auto *Phi = PHINode::Create(StartV->getType(), 2, "compress.idx");
+  Phi->insertBefore(HeaderBB->getFirstInsertionPt());
+  State.set(this, Phi, /*IsScalar=*/true);
+  Phi->addIncoming(StartV, VectorPH);
+}
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+void VPCompressStorePHIRecipe::printRecipe(raw_ostream &O, const Twine &Indent,
+                                           VPSlotTracker &SlotTracker) const {
+  O << Indent << "COMPRESS-STORE-PHI ";
+  printAsOperand(O, SlotTracker);
+  O << " = phi ";
+  printOperands(O, SlotTracker);
+}
+#endif
+
+void VPCompressStoreRecipe::execute(VPTransformState &State) {
+  IRBuilderBase &Builder = State.Builder;
+
+  // Scalar write-index and base pointer.
+  Value *JOld = State.get(getJOld(), /*IsScalar=*/true);
+  Value *BasePtr = State.get(getBasePtr(), /*IsScalar=*/true);
+
+  // Vector data and mask.
+  Value *StoredVal = State.get(getStoredVal());
+  Value *Mask = State.get(getMask());
+
+  // Compute the actual write pointer: base + j.
+  Type *ElemTy = StoredVal->getType()->getScalarType();
+  Value *WritePtr = Builder.CreateGEP(ElemTy, BasePtr, JOld, "compress.ptr",
+                                      /*IsInBounds=*/true);
+
+  // Emit the masked compress-store.
+  Builder.CreateMaskedCompressStore(StoredVal, WritePtr, Alignment, Mask);
+
+  // Compute j_next = j + popcount(mask).
+  // Cast the mask vector to an integer type of the same total bit-width and
+  // use ctpop to count active lanes.
+  VectorType *MaskVTy = cast<VectorType>(Mask->getType());
+  unsigned NumElems =
+      cast<FixedVectorType>(MaskVTy)->getNumElements();
+  Type *IntNTy = Builder.getIntNTy(NumElems);
+  Value *MaskInt = Builder.CreateBitCast(Mask, IntNTy, "mask.int");
+  Value *Popcount = Builder.CreateIntrinsic(
+      IntNTy, Intrinsic::ctpop, {MaskInt}, nullptr, "compress.popcount");
+  // Extend popcount to the index type if needed.
+  if (Popcount->getType() != JOld->getType())
+    Popcount = Builder.CreateZExt(Popcount, JOld->getType(), "compress.cnt");
+  Value *JNext = Builder.CreateAdd(JOld, Popcount, "compress.idx.next",
+                                   /*HasNUW=*/true, /*HasNSW=*/false);
+
+  // This recipe defines j_next, which feeds the compress phi's back-edge.
+  State.set(this, JNext, /*IsScalar=*/true);
+}
+
+InstructionCost VPCompressStoreRecipe::computeCost(ElementCount VF,
+                                                    VPCostContext &Ctx) const {
+  assert(VF.isVector() && "compress-store only meaningful for VF > 1");
+  Type *ScalarTy = Ctx.Types.inferScalarType(getStoredVal());
+  auto *VecTy = VectorType::get(ScalarTy, VF);
+  Type *MaskTy = VectorType::get(Type::getInt1Ty(Ctx.LLVMCtx), VF);
+  IntrinsicCostAttributes ICA(Intrinsic::masked_compressstore,
+                               Type::getVoidTy(Ctx.LLVMCtx),
+                               {VecTy, PointerType::getUnqual(Ctx.LLVMCtx),
+                                MaskTy});
+  // Add the cost of the popcount + add used to advance the write index.
+  Type *IdxTy = Ctx.Types.inferScalarType(getJOld());
+  InstructionCost PopcountCost = Ctx.TTI.getIntrinsicInstrCost(
+      IntrinsicCostAttributes(Intrinsic::ctpop, IdxTy, {IdxTy}),
+      Ctx.CostKind);
+  return Ctx.TTI.getIntrinsicInstrCost(ICA, Ctx.CostKind) + PopcountCost +
+         Ctx.TTI.getArithmeticInstrCost(Instruction::Add, IdxTy, Ctx.CostKind);
+}
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+void VPCompressStoreRecipe::printRecipe(raw_ostream &O, const Twine &Indent,
+                                        VPSlotTracker &SlotTracker) const {
+  O << Indent << "COMPRESS-STORE ";
+  printAsOperand(O, SlotTracker);
+  O << " = compress_store ";
+  printOperands(O, SlotTracker);
 }
 #endif
 

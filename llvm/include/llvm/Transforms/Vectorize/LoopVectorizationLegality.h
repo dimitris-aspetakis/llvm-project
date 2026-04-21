@@ -264,6 +264,32 @@ struct HistogramInfo {
 ///                that may require masking.
 enum class UncountableExitTrait { None, ReadOnly, ReadWrite };
 
+/// This holds details about a compress-store pattern: a store inside a
+/// conditional block whose address is derived from a phi that advances by one
+/// for each active lane, i.e. `if (cond) c[j++] = val`. The mask is not
+/// stored here: the VPlan recipe pulls it from the VPInstruction's block
+/// predicate, which the VPlan predicator computes correctly regardless of
+/// the IR branch polarity.
+struct CompressStoreInfo {
+  /// The phi in the loop header that holds the running write index.
+  PHINode *IndexPhi;
+  /// The phi in the merge block that selects j or j+1.
+  PHINode *MergePhi;
+  /// The `add IndexPhi, 1` instruction.
+  Instruction *IndexInc;
+  /// The conditional store.
+  StoreInst *Store;
+  /// The value being stored (may be computed outside the conditional block).
+  Value *StoredVal;
+  /// The base pointer of the output array (loop-invariant).
+  Value *BasePtr;
+
+  CompressStoreInfo(PHINode *IndexPhi, PHINode *MergePhi, Instruction *IndexInc,
+                    StoreInst *Store, Value *StoredVal, Value *BasePtr)
+      : IndexPhi(IndexPhi), MergePhi(MergePhi), IndexInc(IndexInc),
+        Store(Store), StoredVal(StoredVal), BasePtr(BasePtr) {}
+};
+
 /// LoopVectorizationLegality checks if it is legal to vectorize a loop, and
 /// to what vectorization factor.
 /// This class does not look at the profitability of vectorization, only the
@@ -488,6 +514,30 @@ public:
   /// Returns a list of all known histogram operations in the loop.
   bool hasHistograms() const { return !Histograms.empty(); }
 
+  /// Returns the CompressStoreInfo for the given instruction if it is part of
+  /// a recognised compress-store pattern, or std::nullopt otherwise.
+  std::optional<const CompressStoreInfo *>
+  getCompressStoreInfo(Instruction *I) const {
+    if (CompressStores.empty())
+      return std::nullopt;
+    for (const CompressStoreInfo &CS : CompressStores)
+      if (CS.Store == I || CS.IndexPhi == I || CS.MergePhi == I ||
+          CS.IndexInc == I)
+        return &CS;
+    return std::nullopt;
+  }
+
+  bool hasCompressStores() const { return !CompressStores.empty(); }
+
+  /// Returns the list of header phi nodes that are write-index phis for
+  /// recognised compress-store patterns.
+  SmallVector<PHINode *, 2> getCompressStoreIndexPhis() const {
+    SmallVector<PHINode *, 2> Result;
+    for (const CompressStoreInfo &CS : CompressStores)
+      Result.push_back(CS.IndexPhi);
+    return Result;
+  }
+
   PredicatedScalarEvolution *getPredicatedScalarEvolution() const {
     return &PSE;
   }
@@ -549,6 +599,11 @@ private:
   /// to further analyse some IndirectUnsafe dependences and if they match a
   /// certain pattern (like a histogram) then we may still be able to vectorize.
   bool canVectorizeIndirectUnsafeDependences();
+
+  /// Return true if the loop contains a compress-store pattern (conditional
+  /// store through a phi-based write index) that can be vectorised using
+  /// llvm.masked.compressstore.  Populates CompressStores on success.
+  bool canVectorizeCompressStore();
 
   /// Return true if we can vectorize this loop using the IF-conversion
   /// transformation.
@@ -743,6 +798,10 @@ private:
   /// load -> update -> store instructions where multiple lanes in a vector
   /// may work on the same memory location.
   SmallVector<HistogramInfo, 1> Histograms;
+
+  /// Contains all identified compress-store patterns (conditional stores
+  /// through a phi-based write index).
+  SmallVector<CompressStoreInfo, 1> CompressStores;
 
   /// Whether or not creating SCEV predicates is allowed.
   bool AllowRuntimeSCEVChecks;

@@ -31,6 +31,7 @@
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
@@ -1319,6 +1320,26 @@ tryToUnrollLoop(Loop *L, DominatorTree &DT, LoopInfo *LI, ScalarEvolution &SE,
       !OptForSize) {
     LLVM_DEBUG(dbgs().indent(1) << "Not unrolling: all thresholds are zero.\n");
     return LoopUnrollResult::Unmodified;
+  }
+
+  // Suppress partial/runtime unrolling on loops with a conditional induction
+  // variable. LoopVectorize's compress-store recognizer needs the backedge
+  // merge-PHI structure intact; partial unroll collapses the chain into a
+  // direct expression and the recognition fails. Full unroll is still allowed
+  // because the loop disappears entirely in that case.
+  if (UP.Partial || UP.Runtime) {
+    for (PHINode &PN : L->getHeader()->phis()) {
+      if (!SE.isSCEVable(PN.getType()))
+        continue;
+      if (isa<SCEVConditionalAddRecExpr>(SE.getSCEV(&PN))) {
+        LLVM_DEBUG(dbgs().indent(1)
+                   << "Disabling partial/runtime unroll: conditional IV "
+                   << "present in " << L->getHeader()->getName() << "\n");
+        UP.Partial = false;
+        UP.Runtime = false;
+        break;
+      }
+    }
   }
 
   SmallPtrSet<const Value *, 32> EphValues;

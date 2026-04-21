@@ -135,12 +135,16 @@ struct VPlanTransforms {
   /// VPHeaderPHIRecipe subclasses for inductions, reductions, and
   /// fixed-order recurrences. This processes all header phis and creates
   /// the appropriate widened recipe for each one.
+  /// \p CompressStoreIndexPhis lists header phis that serve as the write-index
+  /// for a compress-store pattern; they are converted to
+  /// VPCompressStorePHIRecipe.
   static void createHeaderPhiRecipes(
       VPlan &Plan, PredicatedScalarEvolution &PSE, Loop &OrigLoop,
       const MapVector<PHINode *, InductionDescriptor> &Inductions,
       const MapVector<PHINode *, RecurrenceDescriptor> &Reductions,
       const SmallPtrSetImpl<const PHINode *> &FixedOrderRecurrences,
-      const SmallPtrSetImpl<PHINode *> &InLoopReductions, bool AllowReordering);
+      const SmallPtrSetImpl<PHINode *> &InLoopReductions, bool AllowReordering,
+      ArrayRef<PHINode *> CompressStoreIndexPhis = {});
 
   /// Create VPReductionRecipes for in-loop reductions. This processes chains
   /// of operations contributing to in-loop reductions and creates appropriate

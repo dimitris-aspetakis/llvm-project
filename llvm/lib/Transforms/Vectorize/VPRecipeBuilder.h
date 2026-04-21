@@ -19,6 +19,7 @@ namespace llvm {
 class LoopVectorizationLegality;
 class LoopVectorizationCostModel;
 class TargetLibraryInfo;
+struct CompressStoreInfo;
 struct HistogramInfo;
 struct VFRange;
 
@@ -89,6 +90,10 @@ public:
   /// Add|Sub + Store operations that perform the histogram in the original
   /// scalar loop.
   VPHistogramRecipe *widenIfHistogram(VPInstruction *VPI);
+
+  /// If \p VPI is a store matching a recognised compress-store pattern, create
+  /// and return a VPCompressStoreRecipe for it; otherwise return nullptr.
+  VPCompressStoreRecipe *widenIfCompressStore(VPInstruction *VPI);
 
   /// If \p VPI is a store of a reduction into an invariant address, delete it.
   /// If it is the final store of a reduction result, a uniform store recipe
