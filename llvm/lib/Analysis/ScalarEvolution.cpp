@@ -6003,6 +6003,46 @@ const SCEV *ScalarEvolution::createSimpleAffineAddRec(PHINode *PN,
   return PHISCEV;
 }
 
+static bool getOperandsForSelectLikePHI(DominatorTree &DT, PHINode *PN,
+                                        Value *&Cond, Value *&LHS, Value *&RHS);
+
+const SCEV *ScalarEvolution::tryBuildConditionalAddRec(PHINode *PN,
+                                                      Value *StartValueV,
+                                                      const Loop *L,
+                                                      Value *Cond, Value *TV,
+                                                      Value *FV) {
+  // Normalize so that FV == PN (the unchanged arm) and TV == PN + Step.
+  // If they come the other way around, negate the condition.
+  bool NegCond = false;
+  if (TV == PN && FV != PN) {
+    std::swap(TV, FV);
+    NegCond = true;
+  }
+  if (FV != PN)
+    return nullptr;
+
+  // TV must be `PN + loop-invariant step`.
+  const SCEV *Step = nullptr;
+  if (auto BO = MatchBinaryOp(TV, getDataLayout(), AC, DT, PN)) {
+    if (BO->Opcode == Instruction::Add) {
+      if (BO->LHS == PN && L->isLoopInvariant(BO->RHS))
+        Step = getSCEV(BO->RHS);
+      else if (BO->RHS == PN && L->isLoopInvariant(BO->LHS))
+        Step = getSCEV(BO->LHS);
+    }
+  }
+  if (!Step)
+    return nullptr;
+
+  const SCEV *CondSCEV = getSCEV(Cond);
+  if (NegCond)
+    CondSCEV = getNotSCEV(CondSCEV);
+  const SCEV *StartVal = getSCEV(StartValueV);
+  const SCEV *PHISCEV = getConditionalAddRecExpr(StartVal, CondSCEV, Step, L);
+  insertValueToMap(PN, PHISCEV);
+  return PHISCEV;
+}
+
 const SCEV *ScalarEvolution::createAddRecFromPHI(PHINode *PN) {
   const Loop *L = LI.getLoopFor(PN->getParent());
   if (!L || L->getHeader() != PN->getParent())
@@ -6039,44 +6079,23 @@ const SCEV *ScalarEvolution::createAddRecFromPHI(PHINode *PN) {
   if (auto *S = createSimpleAffineAddRec(PN, BEValueV, StartValueV))
     return S;
 
-  // Try to recognize: PN = select(Cond, PN+Step, PN) — a conditional IV
-  // where the recurrence advances by Step only when Cond is true.
-  if (auto *SI = dyn_cast<SelectInst>(BEValueV)) {
-    Value *SelCond = SI->getCondition();
-    Value *TV = SI->getTrueValue();
-    Value *FV = SI->getFalseValue();
+  // Select-form: BEValue = select(Cond, PN+Step, PN). Produced by
+  // simplifycfg/instcombine after merging a conditional update.
+  if (auto *SI = dyn_cast<SelectInst>(BEValueV))
+    if (const SCEV *S = tryBuildConditionalAddRec(
+            PN, StartValueV, L, SI->getCondition(), SI->getTrueValue(),
+            SI->getFalseValue()))
+      return S;
 
-    // Normalize so that FV == PN (the unchanged case) and TV == PN+Step.
-    // If it's the other way (TV == PN, FV == PN+Step), negate the condition.
-    bool NegCond = false;
-    if (TV == PN && FV != PN) {
-      std::swap(TV, FV);
-      NegCond = true;
-    }
-
-    if (FV == PN) {
-      // TV must be PN + loop-invariant step.
-      const SCEV *Step = nullptr;
-      if (auto BO = MatchBinaryOp(TV, getDataLayout(), AC, DT, PN)) {
-        if (BO->Opcode == Instruction::Add) {
-          if (BO->LHS == PN && L->isLoopInvariant(BO->RHS))
-            Step = getSCEV(BO->RHS);
-          else if (BO->RHS == PN && L->isLoopInvariant(BO->LHS))
-            Step = getSCEV(BO->LHS);
-        }
-      }
-
-      if (Step) {
-        const SCEV *CondSCEV = getSCEV(SelCond);
-        if (NegCond)
-          CondSCEV = getNotSCEV(CondSCEV);
-        const SCEV *StartVal = getSCEV(StartValueV);
-        const SCEV *PHISCEV =
-            getConditionalAddRecExpr(StartVal, CondSCEV, Step, L);
-        insertValueToMap(PN, PHISCEV);
-        return PHISCEV;
-      }
-    }
+  // Split-CFG form: BEValue is a merge-PHI whose two incoming values come
+  // from opposite sides of a conditional branch. This is the shape clang
+  // emits before simplifycfg runs.
+  if (auto *MergePHI = dyn_cast<PHINode>(BEValueV)) {
+    Value *SelCond = nullptr, *TV = nullptr, *FV = nullptr;
+    if (getOperandsForSelectLikePHI(DT, MergePHI, SelCond, TV, FV))
+      if (const SCEV *S = tryBuildConditionalAddRec(PN, StartValueV, L, SelCond,
+                                                    TV, FV))
+        return S;
   }
 
   // Handle PHI node value symbolically.

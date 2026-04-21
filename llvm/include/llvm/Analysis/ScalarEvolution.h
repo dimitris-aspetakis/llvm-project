@@ -2022,6 +2022,14 @@ private:
   const SCEV *createSimpleAffineAddRec(PHINode *PN, Value *BEValueV,
                                             Value *StartValueV);
 
+  /// Given a (Cond, TV, FV) triple where one of TV/FV is the header phi PN
+  /// (the "unchanged" arm) and the other is `PN + loop-invariant step`,
+  /// build {Start,+[Cond],Step}<L> and cache it on PN. Returns nullptr if
+  /// the shape does not match.
+  const SCEV *tryBuildConditionalAddRec(PHINode *PN, Value *StartValueV,
+                                        const Loop *L, Value *Cond,
+                                        Value *TV, Value *FV);
+
   /// Helper function called from createNodeForPHI.
   const SCEV *createNodeFromSelectLikePHI(PHINode *PN);
 
