@@ -86,14 +86,14 @@ define void @compress_store() {
 ; CHECK-NEXT:  Cost Model: Found an estimated cost of 18 for instruction: call void @llvm.masked.compressstore.v4i64(<4 x i64> poison, ptr poison, <4 x i1> poison)
 ; CHECK-NEXT:  Cost Model: Found an estimated cost of 38 for instruction: call void @llvm.masked.compressstore.v8i64(<8 x i64> poison, ptr poison, <8 x i1> poison)
 ; CHECK-NEXT:  Cost Model: Found an estimated cost of 78 for instruction: call void @llvm.masked.compressstore.v16i64(<16 x i64> poison, ptr poison, <16 x i1> poison)
-; CHECK-NEXT:  Cost Model: Invalid cost for instruction: call void @llvm.masked.compressstore.nxv2i8(<vscale x 2 x i8> poison, ptr poison, <vscale x 2 x i1> poison)
-; CHECK-NEXT:  Cost Model: Invalid cost for instruction: call void @llvm.masked.compressstore.nxv4i8(<vscale x 4 x i8> poison, ptr poison, <vscale x 4 x i1> poison)
-; CHECK-NEXT:  Cost Model: Invalid cost for instruction: call void @llvm.masked.compressstore.nxv8i8(<vscale x 8 x i8> poison, ptr poison, <vscale x 8 x i1> poison)
-; CHECK-NEXT:  Cost Model: Invalid cost for instruction: call void @llvm.masked.compressstore.nxv16i8(<vscale x 16 x i8> poison, ptr poison, <vscale x 16 x i1> poison)
-; CHECK-NEXT:  Cost Model: Invalid cost for instruction: call void @llvm.masked.compressstore.nxv2i64(<vscale x 2 x i64> poison, ptr align 8 poison, <vscale x 2 x i1> poison)
-; CHECK-NEXT:  Cost Model: Invalid cost for instruction: call void @llvm.masked.compressstore.nxv4i64(<vscale x 4 x i64> poison, ptr align 8 poison, <vscale x 4 x i1> poison)
-; CHECK-NEXT:  Cost Model: Invalid cost for instruction: call void @llvm.masked.compressstore.nxv8i64(<vscale x 8 x i64> poison, ptr align 8 poison, <vscale x 8 x i1> poison)
-; CHECK-NEXT:  Cost Model: Invalid cost for instruction: call void @llvm.masked.compressstore.nxv16i64(<vscale x 16 x i64> poison, ptr align 8 poison, <vscale x 16 x i1> poison)
+; CHECK-NEXT:  Cost Model: Found an estimated cost of 3 for instruction: call void @llvm.masked.compressstore.nxv2i8(<vscale x 2 x i8> poison, ptr poison, <vscale x 2 x i1> poison)
+; CHECK-NEXT:  Cost Model: Found an estimated cost of 3 for instruction: call void @llvm.masked.compressstore.nxv4i8(<vscale x 4 x i8> poison, ptr poison, <vscale x 4 x i1> poison)
+; CHECK-NEXT:  Cost Model: Found an estimated cost of 3 for instruction: call void @llvm.masked.compressstore.nxv8i8(<vscale x 8 x i8> poison, ptr poison, <vscale x 8 x i1> poison)
+; CHECK-NEXT:  Cost Model: Found an estimated cost of 6 for instruction: call void @llvm.masked.compressstore.nxv16i8(<vscale x 16 x i8> poison, ptr poison, <vscale x 16 x i1> poison)
+; CHECK-NEXT:  Cost Model: Found an estimated cost of 6 for instruction: call void @llvm.masked.compressstore.nxv2i64(<vscale x 2 x i64> poison, ptr align 8 poison, <vscale x 2 x i1> poison)
+; CHECK-NEXT:  Cost Model: Found an estimated cost of 12 for instruction: call void @llvm.masked.compressstore.nxv4i64(<vscale x 4 x i64> poison, ptr align 8 poison, <vscale x 4 x i1> poison)
+; CHECK-NEXT:  Cost Model: Found an estimated cost of 24 for instruction: call void @llvm.masked.compressstore.nxv8i64(<vscale x 8 x i64> poison, ptr align 8 poison, <vscale x 8 x i1> poison)
+; CHECK-NEXT:  Cost Model: Found an estimated cost of 48 for instruction: call void @llvm.masked.compressstore.nxv16i64(<vscale x 16 x i64> poison, ptr align 8 poison, <vscale x 16 x i1> poison)
 ; CHECK-NEXT:  Cost Model: Found an estimated cost of 0 for instruction: ret void
 ;
 ; TYPEBASED-LABEL: 'compress_store'

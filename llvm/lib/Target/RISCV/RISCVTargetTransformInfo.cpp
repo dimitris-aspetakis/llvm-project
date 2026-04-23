@@ -3372,7 +3372,7 @@ bool RISCVTTIImpl::isLegalMaskedExpandLoad(Type *DataTy,
 bool RISCVTTIImpl::isLegalMaskedCompressStore(Type *DataTy,
                                               Align Alignment) const {
   auto *VTy = dyn_cast<VectorType>(DataTy);
-  if (!VTy || VTy->isScalableTy())
+  if (!VTy)
     return false;
 
   if (!isLegalMaskedLoadStore(DataTy, Alignment))
