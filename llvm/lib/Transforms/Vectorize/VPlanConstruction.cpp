@@ -724,7 +724,7 @@ void VPlanTransforms::createHeaderPhiRecipes(
     const SmallPtrSetImpl<const PHINode *> &FixedOrderRecurrences,
     const SmallPtrSetImpl<PHINode *> &InLoopReductions, bool AllowReordering,
     ArrayRef<PHINode *> CompressStoreIndexPhis) {
-  // Retrieve the header manually from the initial plain-CFG VPlan.
+  // Retrieve the header manually from the intial plain-CFG VPlan.
   VPBasicBlock *HeaderVPBB = cast<VPBasicBlock>(
       Plan.getEntry()->getSuccessors()[1]->getSingleSuccessor());
   assert(VPDominatorTree(Plan).dominates(HeaderVPBB,
@@ -1194,6 +1194,14 @@ void VPlanTransforms::foldTailByMasking(VPlan &Plan) {
   // Any extract of the last element must be updated to extract from the last
   // active lane of the header mask instead (i.e., the lane corresponding to the
   // last active iteration).
+  //
+  // Note: this rewrite is only correct for live-outs that are freshly produced
+  // from the current lane's input on each iteration (e.g. `return ld;` after
+  // `ld = p[i]`). It is NOT correct for loop-carried accumulators whose
+  // exit value depends on all lanes up through LastActiveLane — those have a
+  // per-iteration scalar `.next` value and the owning recipe is responsible
+  // for short-circuiting this rewrite from its own fixup. See
+  // VPRecipeBuilder::widenIfCompressStore for an example.
   Builder.setInsertPoint(Plan.getMiddleBlock()->getTerminator());
   for (VPRecipeBase &R : *Plan.getMiddleBlock()) {
     VPValue *Op;

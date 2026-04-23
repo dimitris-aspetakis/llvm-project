@@ -2144,16 +2144,15 @@ void VPCompressStoreRecipe::execute(VPTransformState &State) {
   // Emit the masked compress-store.
   Builder.CreateMaskedCompressStore(StoredVal, WritePtr, Alignment, Mask);
 
-  // Compute j_next = j + popcount(mask).
-  // Cast the mask vector to an integer type of the same total bit-width and
-  // use ctpop to count active lanes.
+  // Compute j_next = j + popcount(mask). Zero-extend the predicate to a byte
+  // vector and reduce-add it — works uniformly for fixed and scalable VFs,
+  // and lowers to vpopcnt/vcpop.m/CNTP on the major targets.
   VectorType *MaskVTy = cast<VectorType>(Mask->getType());
-  unsigned NumElems =
-      cast<FixedVectorType>(MaskVTy)->getNumElements();
-  Type *IntNTy = Builder.getIntNTy(NumElems);
-  Value *MaskInt = Builder.CreateBitCast(Mask, IntNTy, "mask.int");
-  Value *Popcount = Builder.CreateIntrinsic(
-      IntNTy, Intrinsic::ctpop, {MaskInt}, nullptr, "compress.popcount");
+  auto *CountVTy =
+      VectorType::get(Builder.getInt8Ty(), MaskVTy->getElementCount());
+  Value *MaskI8 = Builder.CreateZExt(Mask, CountVTy, "mask.zext");
+  Value *Popcount = Builder.CreateUnaryIntrinsic(
+      Intrinsic::vector_reduce_add, MaskI8, nullptr, "compress.popcount");
   // Extend popcount to the index type if needed.
   if (Popcount->getType() != JOld->getType())
     Popcount = Builder.CreateZExt(Popcount, JOld->getType(), "compress.cnt");
@@ -2170,16 +2169,24 @@ InstructionCost VPCompressStoreRecipe::computeCost(ElementCount VF,
   Type *ScalarTy = Ctx.Types.inferScalarType(getStoredVal());
   auto *VecTy = VectorType::get(ScalarTy, VF);
   Type *MaskTy = VectorType::get(Type::getInt1Ty(Ctx.LLVMCtx), VF);
-  IntrinsicCostAttributes ICA(Intrinsic::masked_compressstore,
-                               Type::getVoidTy(Ctx.LLVMCtx),
-                               {VecTy, PointerType::getUnqual(Ctx.LLVMCtx),
-                                MaskTy});
+  // Route through getMemIntrinsicInstrCost so target-specific handlers (e.g.
+  // RISCVTTIImpl::getExpandCompressMemoryOpCost) are invoked rather than the
+  // generic gather/scatter fallback in getTypeBasedIntrinsicInstrCost.
+  MemIntrinsicCostAttributes MICA(Intrinsic::masked_compressstore, VecTy,
+                                  /*VariableMask=*/true, Alignment);
+  InstructionCost StoreCost = Ctx.TTI.getMemIntrinsicInstrCost(
+      MICA, Ctx.CostKind);
   // Add the cost of the popcount + add used to advance the write index.
+  // execute() emits: j_next = j + reduce.add(zext(mask, <VF x i8>)), so we
+  // cost the zext, the vector reduction, and the scalar add.
   Type *IdxTy = Ctx.Types.inferScalarType(getJOld());
-  InstructionCost PopcountCost = Ctx.TTI.getIntrinsicInstrCost(
-      IntrinsicCostAttributes(Intrinsic::ctpop, IdxTy, {IdxTy}),
-      Ctx.CostKind);
-  return Ctx.TTI.getIntrinsicInstrCost(ICA, Ctx.CostKind) + PopcountCost +
+  auto *CountVTy = VectorType::get(Type::getInt8Ty(Ctx.LLVMCtx), VF);
+  InstructionCost ZExtCost = Ctx.TTI.getCastInstrCost(
+      Instruction::ZExt, CountVTy, MaskTy,
+      TTI::CastContextHint::None, Ctx.CostKind);
+  InstructionCost ReduceCost = Ctx.TTI.getArithmeticReductionCost(
+      Instruction::Add, CountVTy, std::nullopt, Ctx.CostKind);
+  return StoreCost + ZExtCost + ReduceCost +
          Ctx.TTI.getArithmeticInstrCost(Instruction::Add, IdxTy, Ctx.CostKind);
 }
 

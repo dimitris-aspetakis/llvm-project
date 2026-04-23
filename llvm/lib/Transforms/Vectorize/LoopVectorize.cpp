@@ -5796,6 +5796,21 @@ void LoopVectorizationCostModel::collectValuesToIgnore() {
     const InductionDescriptor &IndDes = Induction.second;
     VecValuesToIgnore.insert_range(IndDes.getCastInsts());
   }
+
+  // Compress-store replaces the write-index increment and merge-phi with a
+  // single VPCompressStoreRecipe; the original IndexInc / MergePhi become
+  // dead in the vector form, so their cost must not be counted (especially
+  // at scalable VFs where a replicated scalar add has invalid cost).
+  if (Legal->hasCompressStores()) {
+    for (PHINode *IndexPhi : Legal->getCompressStoreIndexPhis()) {
+      auto MaybeCSI = Legal->getCompressStoreInfo(IndexPhi);
+      if (!MaybeCSI)
+        continue;
+      const auto *CSI = *MaybeCSI;
+      VecValuesToIgnore.insert(CSI->IndexInc);
+      VecValuesToIgnore.insert(CSI->MergePhi);
+    }
+  }
 }
 
 // This function will select a scalable VF if the target supports scalable
@@ -6864,11 +6879,29 @@ VPRecipeBuilder::widenIfCompressStore(VPInstruction *VPI) {
 
   for (VPUser *U : make_early_inc_range(OldBackedge->users())) {
     auto *ExtractR = dyn_cast<VPInstruction>(U);
-    if (!ExtractR ||
-        ExtractR->getOpcode() != VPInstruction::ExtractLastPart)
+    if (!ExtractR)
       continue;
-    ExtractR->replaceAllUsesWith(CSRecipe);
-    ExtractR->eraseFromParent();
+
+    // Classic (scalar-epilogue) path: the exit value is an
+    // ExtractLastPart(backedge). Replace with the scalar CSRecipe output.
+    if (ExtractR->getOpcode() == VPInstruction::ExtractLastPart) {
+      ExtractR->replaceAllUsesWith(CSRecipe);
+      ExtractR->eraseFromParent();
+      continue;
+    }
+
+    // EVL tail-fold path: foldTailByMasking has already rewritten the
+    // ExtractLastLane(ExtractLastPart(Op)) exit pattern into
+    // ExtractLane(LastActiveLane(HeaderMask), Op). For compress-store the
+    // correct exit value is still the scalar j_next accumulator; redirect
+    // these users too, otherwise they compute
+    //   j_old + (cond[last_active_lane] ? 1 : 0)
+    // rather than j_old + popcount(last_iter_mask).
+    if (ExtractR->getOpcode() == VPInstruction::ExtractLane) {
+      auto *Idx = dyn_cast<VPInstruction>(ExtractR->getOperand(0));
+      if (Idx && Idx->getOpcode() == VPInstruction::LastActiveLane)
+        ExtractR->replaceAllUsesWith(CSRecipe);
+    }
   }
 
   return CSRecipe;

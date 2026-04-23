@@ -3,8 +3,8 @@
 ; RUN:   -S < %s | FileCheck %s
 
 ; Tests that conditional-store-to-packed-array loops are vectorized to
-; llvm.masked.compressstore + llvm.ctpop. Recognition is SCEV-driven: the
-; write-index phi is identified by its SCEVConditionalAddRecExpr.
+; llvm.masked.compressstore + llvm.vector.reduce.add. Recognition is SCEV-
+; driven: the write-index phi is identified by its SCEVConditionalAddRecExpr.
 ;
 ;   int j = 0;
 ;   for (int i = 0; i < N; ++i)
@@ -22,7 +22,7 @@ target triple = "x86_64-unknown-linux-gnu"
 ; CHECK:         [[MASK:%.+]] = icmp
 ; CHECK:         [[WIDE_LOAD:%.+]] = call <16 x i32> @llvm.masked.load
 ; CHECK:         call void @llvm.masked.compressstore.v16i32(<16 x i32> [[WIDE_LOAD]], ptr{{.*}}, <16 x i1> [[MASK]])
-; CHECK:         [[POPCOUNT:%.+]] = call i{{[0-9]+}} @llvm.ctpop.i{{[0-9]+}}(
+; CHECK:         [[POPCOUNT:%.+]] = call i{{[0-9]+}} @llvm.vector.reduce.add.v{{[0-9]+}}i8(
 ; CHECK:         [[IDX_NEXT:%compress\.idx\.next.*]] = add{{.*}} i32 [[COMPRESS_IDX]], {{%.+}}
 define void @compress_store_i32(ptr noalias %a, ptr noalias %cond_arr,
                                  ptr noalias %c, i32 %N) {
@@ -68,7 +68,7 @@ for.end:
 ; CHECK:       vector.body:
 ; CHECK:         [[COMPRESS_IDX2:%compress\.idx.*]] = phi i32
 ; CHECK:         call void @llvm.masked.compressstore.v16i32(
-; CHECK:         call i{{[0-9]+}} @llvm.ctpop.i{{[0-9]+}}(
+; CHECK:         call i{{[0-9]+}} @llvm.vector.reduce.add.v{{[0-9]+}}i8(
 define void @compress_store_i32_i64tc(ptr noalias %a, ptr noalias %cond_arr,
                                        ptr noalias %c, i64 %N) {
 entry:
@@ -114,7 +114,7 @@ for.end:
 ; CHECK:       vector.body:
 ; CHECK:         [[COMPRESS_IDX3:%compress\.idx.*]] = phi i32{{.*}}[ %start, {{.*}}]
 ; CHECK:         call void @llvm.masked.compressstore.v16i32(
-; CHECK:         call i{{[0-9]+}} @llvm.ctpop.i{{[0-9]+}}(
+; CHECK:         call i{{[0-9]+}} @llvm.vector.reduce.add.v{{[0-9]+}}i8(
 define void @compress_store_nonzero_start(ptr noalias %a, ptr noalias %cond_arr,
                                            ptr noalias %c, i32 %N,
                                            i32 %start) {
