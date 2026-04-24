@@ -4889,6 +4889,15 @@ AArch64TTIImpl::getMemIntrinsicInstrCost(const MemIntrinsicCostAttributes &MICA,
   case Intrinsic::masked_expandload:
   case Intrinsic::masked_store:
     return getMaskedMemoryOpCost(MICA, CostKind);
+  case Intrinsic::masked_compressstore: {
+    // On SVE, compress-store lowers to a COMPACT followed by a predicated
+    // ST1. Use the masked-store cost plus a small constant for the COMPACT
+    // and the CNTP / WHILELO bookkeeping that advances the write index.
+    InstructionCost Base = getMaskedMemoryOpCost(MICA, CostKind);
+    if (!Base.isValid())
+      return Base;
+    return Base + 2;
+  }
   }
   return BaseT::getMemIntrinsicInstrCost(MICA, CostKind);
 }
