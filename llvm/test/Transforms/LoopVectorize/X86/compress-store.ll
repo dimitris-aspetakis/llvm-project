@@ -1,6 +1,8 @@
 ; RUN: opt -mattr=+avx512f -passes=loop-vectorize \
 ; RUN:   -force-vector-width=16 -force-vector-interleave=1 \
 ; RUN:   -S < %s | FileCheck %s
+; RUN: opt -mattr=+avx512f -passes=loop-vectorize -S \
+; RUN:   < %s | FileCheck %s --check-prefix=COSTMODEL
 
 ; Tests that conditional-store-to-packed-array loops are vectorized to
 ; llvm.masked.compressstore + llvm.vector.reduce.add. Recognition is SCEV-
@@ -152,6 +154,101 @@ for.inc:
 
 for.end:
   ret void
+}
+
+; Cost-model regression tests (the upstream issue repro). Before the
+; X86TTIImpl::getMemIntrinsicInstrCost case for masked_compressstore /
+; masked_expandload was added, the recipe was costed via
+; BaseT::getCommonMaskedMemoryOpCost with IsGatherScatter=true, which
+; inflated the VF=16 cost from ~9 to ~77 and made the cost model pick
+; scalar even though vpcompressd / vcompressps is a single AVX-512F
+; instruction. The COSTMODEL RUN line runs without -force-vector-width
+; to exercise the actual cost-model decision.
+;
+; Threshold-comparison predicate (`in[i] > T`) on i32 — vpcompressd shape.
+; CHECK-LABEL: @compress_store_threshold_filter_i32(
+; COSTMODEL-LABEL: @compress_store_threshold_filter_i32(
+; COSTMODEL:       vector.body:
+; COSTMODEL:         call void @llvm.masked.compressstore.v{{[0-9]+}}i32(<{{[0-9]+}} x i32>
+; COSTMODEL:         call i{{[0-9]+}} @llvm.vector.reduce.add.v{{[0-9]+}}i8(
+define i32 @compress_store_threshold_filter_i32(ptr noalias %in, ptr noalias %out,
+                                                  i32 %N, i32 %T) {
+entry:
+  %cmp_entry = icmp sgt i32 %N, 0
+  br i1 %cmp_entry, label %for.body.preheader, label %for.end
+
+for.body.preheader:
+  br label %for.body
+
+for.body:
+  %i = phi i32 [ 0, %for.body.preheader ], [ %i.next, %for.inc ]
+  %j = phi i32 [ 0, %for.body.preheader ], [ %j.next, %for.inc ]
+  %in_ptr = getelementptr inbounds i32, ptr %in, i32 %i
+  %val = load i32, ptr %in_ptr, align 4
+  %cond = icmp sgt i32 %val, %T
+  br i1 %cond, label %if.then, label %if.end
+
+if.then:
+  %out_ptr = getelementptr inbounds i32, ptr %out, i32 %j
+  store i32 %val, ptr %out_ptr, align 4
+  %j.inc = add i32 %j, 1
+  br label %if.end
+
+if.end:
+  %j.next = phi i32 [ %j, %for.body ], [ %j.inc, %if.then ]
+  br label %for.inc
+
+for.inc:
+  %i.next = add nuw nsw i32 %i, 1
+  %exitcond = icmp eq i32 %i.next, %N
+  br i1 %exitcond, label %for.end, label %for.body
+
+for.end:
+  %j.lcssa = phi i32 [ 0, %entry ], [ %j.next, %for.inc ]
+  ret i32 %j.lcssa
+}
+
+; vcompressps shape (f32). Same cost-model gate.
+; CHECK-LABEL: @compress_store_threshold_filter_f32(
+; COSTMODEL-LABEL: @compress_store_threshold_filter_f32(
+; COSTMODEL:       vector.body:
+; COSTMODEL:         call void @llvm.masked.compressstore.v{{[0-9]+}}f32(<{{[0-9]+}} x float>
+; COSTMODEL:         call i{{[0-9]+}} @llvm.vector.reduce.add.v{{[0-9]+}}i8(
+define i32 @compress_store_threshold_filter_f32(ptr noalias %in, ptr noalias %out,
+                                                  i32 %N, float %T) {
+entry:
+  %cmp_entry = icmp sgt i32 %N, 0
+  br i1 %cmp_entry, label %for.body.preheader, label %for.end
+
+for.body.preheader:
+  br label %for.body
+
+for.body:
+  %i = phi i32 [ 0, %for.body.preheader ], [ %i.next, %for.inc ]
+  %j = phi i32 [ 0, %for.body.preheader ], [ %j.next, %for.inc ]
+  %in_ptr = getelementptr inbounds float, ptr %in, i32 %i
+  %val = load float, ptr %in_ptr, align 4
+  %cond = fcmp ogt float %val, %T
+  br i1 %cond, label %if.then, label %if.end
+
+if.then:
+  %out_ptr = getelementptr inbounds float, ptr %out, i32 %j
+  store float %val, ptr %out_ptr, align 4
+  %j.inc = add i32 %j, 1
+  br label %if.end
+
+if.end:
+  %j.next = phi i32 [ %j, %for.body ], [ %j.inc, %if.then ]
+  br label %for.inc
+
+for.inc:
+  %i.next = add nuw nsw i32 %i, 1
+  %exitcond = icmp eq i32 %i.next, %N
+  br i1 %exitcond, label %for.end, label %for.body
+
+for.end:
+  %j.lcssa = phi i32 [ 0, %entry ], [ %j.next, %for.inc ]
+  ret i32 %j.lcssa
 }
 
 ; Negative: step is 2, not 1. The SCEV recognizer's MVP requires a constant

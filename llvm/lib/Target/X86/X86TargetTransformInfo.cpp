@@ -5446,6 +5446,14 @@ X86TTIImpl::getMemIntrinsicInstrCost(const MemIntrinsicCostAttributes &MICA,
   case Intrinsic::masked_load:
   case Intrinsic::masked_store:
     return getMaskedMemoryOpCost(MICA, CostKind);
+  case Intrinsic::masked_compressstore:
+  case Intrinsic::masked_expandload:
+    // On AVX-512 these lower to a single masked memory op (vcompressps /
+    // vpcompressd / vexpandps / ...). Cost them like a masked store/load
+    // rather than letting BaseT route them through getCommonMaskedMemoryOpCost
+    // with IsGatherScatter=true, which prices them as a per-element scatter
+    // and inflates the cost by ~75x at zmm widths.
+    return getMaskedMemoryOpCost(MICA, CostKind);
   }
   return BaseT::getMemIntrinsicInstrCost(MICA, CostKind);
 }
